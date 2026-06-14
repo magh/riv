@@ -7,9 +7,11 @@ A simple GUI image viewer written in Rust that displays images in a native windo
 - Displays images in a native GUI window
 - Multi-image support with navigation controls
 - Supports common image formats (PNG, JPEG, GIF, BMP, etc.)
-- Automatic window sizing based on image dimensions
-- Custom window width and height options
-- Fullscreen toggle functionality
+- Automatic window sizing based on image dimensions (capped so large images stay on-screen)
+- Custom initial window width and height options
+- Real fullscreen toggle that uses the monitor the window is on (multi-monitor friendly)
+- Aspect-ratio-preserving scaling with black letterboxing
+- Event-driven rendering — an idle window uses no CPU
 - Simple keyboard controls for navigation
 
 ## Installation
@@ -48,8 +50,8 @@ Arguments:
 
 Options:
   -v, --verbose          Enable verbose output
-  -w, --width <WIDTH>    Set window width (default: image width or 800)
-  -H, --height <HEIGHT>  Set window height (default: image height or 600)
+  -w, --width <WIDTH>    Set initial window width
+  -H, --height <HEIGHT>  Set initial window height
   -h, --help             Print help
   -V, --version          Print version
 ```

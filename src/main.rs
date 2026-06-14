@@ -1,10 +1,22 @@
-use anyhow::{Context, Result};
-use clap::Parser;
 use std::fs;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::rc::Rc;
 
-use image::GenericImageView;
-use minifb::{Key, Window, WindowOptions};
+use anyhow::{Context as _, Result};
+use clap::Parser;
+use image::{DynamicImage, GenericImageView};
+use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
+use winit::event::{ElementState, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key, NamedKey};
+use winit::window::{Fullscreen, Window, WindowId};
+
+/// Cap for the default window size when no explicit dimensions are given, so
+/// large images do not spawn windows bigger than the screen.
+const MAX_DEFAULT_WIDTH: u32 = 1280;
+const MAX_DEFAULT_HEIGHT: u32 = 800;
 
 #[derive(Parser)]
 #[command(name = "riv")]
@@ -17,19 +29,11 @@ struct Args {
     #[arg(short, long, help = "Enable verbose output")]
     verbose: bool,
 
-    #[arg(
-        short = 'w',
-        long,
-        help = "Set window width (default: image width or 800)"
-    )]
-    width: Option<usize>,
+    #[arg(short = 'w', long, help = "Set initial window width")]
+    width: Option<u32>,
 
-    #[arg(
-        short = 'H',
-        long,
-        help = "Set window height (default: image height or 600)"
-    )]
-    height: Option<usize>,
+    #[arg(short = 'H', long, help = "Set initial window height")]
+    height: Option<u32>,
 }
 
 fn main() -> Result<()> {
@@ -47,302 +51,322 @@ fn main() -> Result<()> {
         }
     }
 
-    let viewer = ImageViewer::new(args.width, args.height);
-    viewer.display_images(args.image_paths)?;
+    let event_loop = EventLoop::new().context("Failed to create event loop")?;
+    // Event-driven: the loop sleeps until something happens instead of busy
+    // redrawing, so an idle viewer uses no CPU.
+    event_loop.set_control_flow(ControlFlow::Wait);
+
+    let mut app = App::new(args).context("Failed to load the first image")?;
+    event_loop.run_app(&mut app).context("Event loop error")?;
 
     Ok(())
 }
 
-struct ImageViewer {
-    width: Option<usize>,
-    height: Option<usize>,
+/// A copy of the source image resized to fit the current window, kept around so
+/// we only run the (relatively expensive) resize when the window size or the
+/// image actually changes — not on every frame.
+struct Scaled {
+    pixels: Vec<u32>,
+    width: u32,
+    height: u32,
 }
 
-impl ImageViewer {
-    fn new(width: Option<usize>, height: Option<usize>) -> Self {
-        ImageViewer { width, height }
+type SharedWindow = Rc<Window>;
+
+struct App {
+    paths: Vec<PathBuf>,
+    index: usize,
+    image: DynamicImage,
+    /// Bumped whenever a new image is loaded, used to invalidate `scaled`.
+    generation: u64,
+    requested_width: Option<u32>,
+    requested_height: Option<u32>,
+    fullscreen: bool,
+
+    window: Option<SharedWindow>,
+    context: Option<softbuffer::Context<SharedWindow>>,
+    surface: Option<softbuffer::Surface<SharedWindow, SharedWindow>>,
+
+    scaled: Option<Scaled>,
+    /// (window_width, window_height, generation) the cached `scaled` was built for.
+    scaled_key: Option<(u32, u32, u64)>,
+}
+
+impl App {
+    fn new(args: Args) -> Result<Self> {
+        let image = open_image(&args.image_paths[0])?;
+        Ok(App {
+            paths: args.image_paths,
+            index: 0,
+            image,
+            generation: 0,
+            requested_width: args.width,
+            requested_height: args.height,
+            fullscreen: false,
+            window: None,
+            context: None,
+            surface: None,
+            scaled: None,
+            scaled_key: None,
+        })
     }
 
-    fn display_images(&self, mut paths: Vec<PathBuf>) -> Result<()> {
-        if paths.is_empty() {
-            return Err(anyhow::anyhow!("No image paths provided"));
-        }
-
-        let mut current_index = 0;
-        let mut current_img = self.load_image(&paths[current_index])?;
-        let (img_width, img_height) = current_img.dimensions();
-
-        let initial_width = self.width.unwrap_or(img_width as usize);
-        let initial_height = self.height.unwrap_or(img_height as usize);
-
-        let window_options = WindowOptions {
-            resize: true,
-            ..WindowOptions::default()
-        };
-
-        let mut window = Window::new(
-            &self.get_window_title(&paths[current_index], current_index, paths.len()),
-            initial_width,
-            initial_height,
-            window_options,
-        )
-        .context("Failed to create window")?;
-
-        window.limit_update_rate(Some(std::time::Duration::from_millis(16)));
-
-        let mut current_width = initial_width;
-        let mut current_height = initial_height;
-        let mut buffer = self.create_buffer(&current_img, current_width, current_height);
-        let mut f_pressed = false;
-        let mut n_pressed = false;
-        let mut p_pressed = false;
-        let mut d_pressed = false;
-        let mut is_fullscreen = false;
-        let fullscreen_width = 1920; // TODO: Get actual monitor dimensions
-        let fullscreen_height = 1080;
-
-        while window.is_open() && !window.is_key_down(Key::Q) && !window.is_key_down(Key::Escape) {
-            let f_key_down = window.is_key_down(Key::F);
-            let n_key_down = window.is_key_down(Key::N);
-            let p_key_down = window.is_key_down(Key::P);
-            let d_key_down = window.is_key_down(Key::D);
-
-            // Handle fullscreen toggle
-            if f_key_down && !f_pressed {
-                is_fullscreen = !is_fullscreen;
-
-                // Create new window with appropriate settings
-                if is_fullscreen {
-                    let fs_options = WindowOptions {
-                        borderless: true,
-                        resize: false,
-                        ..WindowOptions::default()
-                    };
-
-                    window = Window::new(
-                        &self.get_window_title(&paths[current_index], current_index, paths.len()),
-                        fullscreen_width,
-                        fullscreen_height,
-                        fs_options,
-                    )
-                    .context("Failed to create fullscreen window")?;
-
-                    window.set_position(0, 0);
-                    current_width = fullscreen_width;
-                    current_height = fullscreen_height;
-                } else {
-                    let win_options = WindowOptions {
-                        resize: true,
-                        ..WindowOptions::default()
-                    };
-
-                    window = Window::new(
-                        &self.get_window_title(&paths[current_index], current_index, paths.len()),
-                        initial_width,
-                        initial_height,
-                        win_options,
-                    )
-                    .context("Failed to create windowed window")?;
-
-                    current_width = initial_width;
-                    current_height = initial_height;
-                }
-
-                window.limit_update_rate(Some(std::time::Duration::from_millis(16)));
-                buffer = self.create_buffer(&current_img, current_width, current_height);
-                f_pressed = true;
-            } else if !f_key_down {
-                f_pressed = false;
-            }
-
-            // Handle next image
-            if n_key_down && !n_pressed && paths.len() > 1 {
-                current_index = (current_index + 1) % paths.len();
-                match self.load_image(&paths[current_index]) {
-                    Ok(img) => {
-                        current_img = img;
-                        buffer = self.create_buffer(&current_img, current_width, current_height);
-                        window.set_title(&self.get_window_title(
-                            &paths[current_index],
-                            current_index,
-                            paths.len(),
-                        ));
-                    }
-                    Err(e) => eprintln!(
-                        "Failed to load image {}: {}",
-                        paths[current_index].display(),
-                        e
-                    ),
-                }
-                n_pressed = true;
-            } else if !n_key_down {
-                n_pressed = false;
-            }
-
-            // Handle previous image
-            if p_key_down && !p_pressed && paths.len() > 1 {
-                current_index = if current_index == 0 {
-                    paths.len() - 1
-                } else {
-                    current_index - 1
-                };
-                match self.load_image(&paths[current_index]) {
-                    Ok(img) => {
-                        current_img = img;
-                        buffer = self.create_buffer(&current_img, current_width, current_height);
-                        window.set_title(&self.get_window_title(
-                            &paths[current_index],
-                            current_index,
-                            paths.len(),
-                        ));
-                    }
-                    Err(e) => eprintln!(
-                        "Failed to load image {}: {}",
-                        paths[current_index].display(),
-                        e
-                    ),
-                }
-                p_pressed = true;
-            } else if !p_key_down {
-                p_pressed = false;
-            }
-
-            // Handle delete image
-            if d_key_down && !d_pressed {
-                if let Err(e) = fs::remove_file(&paths[current_index]) {
-                    eprintln!(
-                        "Failed to delete image {}: {}",
-                        paths[current_index].display(),
-                        e
-                    );
-                } else {
-                    println!("Deleted image: {}", paths[current_index].display());
-
-                    // Remove the deleted file from the paths vector
-                    paths.remove(current_index);
-
-                    // If no images left, exit the application
-                    if paths.is_empty() {
-                        break;
-                    }
-
-                    // Adjust current_index if it's now out of bounds
-                    if current_index >= paths.len() {
-                        current_index = 0; // Wrap to first image
-                    }
-
-                    // Load the next image
-                    match self.load_image(&paths[current_index]) {
-                        Ok(img) => {
-                            current_img = img;
-                            buffer =
-                                self.create_buffer(&current_img, current_width, current_height);
-                            window.set_title(&self.get_window_title(
-                                &paths[current_index],
-                                current_index,
-                                paths.len(),
-                            ));
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "Failed to load next image {}: {}",
-                                paths[current_index].display(),
-                                e
-                            );
-                            break;
-                        }
-                    }
-                }
-                d_pressed = true;
-            } else if !d_key_down {
-                d_pressed = false;
-            }
-
-            // Handle window resizing
-            if !is_fullscreen {
-                let (window_width, window_height) = window.get_size();
-                if window_width != current_width || window_height != current_height {
-                    current_width = window_width;
-                    current_height = window_height;
-                    buffer = self.create_buffer(&current_img, current_width, current_height);
-                }
-            }
-
-            window
-                .update_with_buffer(&buffer, current_width, current_height)
-                .context("Failed to update window buffer")?;
-        }
-
-        Ok(())
-    }
-
-    fn load_image(&self, path: &PathBuf) -> Result<image::DynamicImage> {
-        image::open(path).with_context(|| format!("Failed to open image: {}", path.display()))
-    }
-
-    fn get_window_title(&self, path: &std::path::Path, index: usize, total: usize) -> String {
-        let filename = path.file_name().unwrap_or_default().to_string_lossy();
-        if total > 1 {
+    fn title(&self) -> String {
+        let filename = self.paths[self.index]
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        if self.paths.len() > 1 {
             format!(
                 "RIV - {} ({}/{}) - [f] fullscreen, [n] next, [p] prev, [d] delete",
                 filename,
-                index + 1,
-                total
+                self.index + 1,
+                self.paths.len()
             )
         } else {
             format!("RIV - {} - [f] fullscreen, [d] delete", filename)
         }
     }
 
-    fn create_buffer(&self, img: &image::DynamicImage, width: usize, height: usize) -> Vec<u32> {
-        let (img_width, img_height) = img.dimensions();
-        let img_aspect = img_width as f64 / img_height as f64;
-        let window_aspect = width as f64 / height as f64;
+    fn handle_key(&mut self, key: Key, event_loop: &ActiveEventLoop) {
+        match key.as_ref() {
+            Key::Named(NamedKey::Escape) | Key::Character("q") | Key::Character("Q") => {
+                event_loop.exit();
+            }
+            Key::Character("f") | Key::Character("F") => self.toggle_fullscreen(),
+            Key::Character("n") | Key::Character("N") => self.step_image(1),
+            Key::Character("p") | Key::Character("P") => self.step_image(-1),
+            Key::Character("d") | Key::Character("D") => self.delete_image(event_loop),
+            _ => {}
+        }
+    }
 
-        let (scaled_width, scaled_height) = if img_aspect > window_aspect {
-            // Image is wider than window - fit to width
-            let scaled_width = width;
-            let scaled_height = (width as f64 / img_aspect) as usize;
-            (scaled_width, scaled_height)
-        } else {
-            // Image is taller than window - fit to height
-            let scaled_height = height;
-            let scaled_width = (height as f64 * img_aspect) as usize;
-            (scaled_width, scaled_height)
-        };
+    fn toggle_fullscreen(&mut self) {
+        self.fullscreen = !self.fullscreen;
+        if let Some(window) = &self.window {
+            // `Borderless(None)` fullscreens on the monitor the window is
+            // currently on, so multi-monitor setups behave correctly without
+            // recreating the window.
+            let mode = self.fullscreen.then_some(Fullscreen::Borderless(None));
+            window.set_fullscreen(mode);
+            window.request_redraw();
+        }
+    }
 
-        // Create black buffer for letterboxing
-        let mut buffer = vec![0u32; width * height]; // Black background
+    fn step_image(&mut self, delta: isize) {
+        if self.paths.len() < 2 {
+            return;
+        }
+        let len = self.paths.len() as isize;
+        self.index = (((self.index as isize + delta) % len + len) % len) as usize;
+        self.show_current();
+    }
 
-        // Resize image maintaining aspect ratio
-        let resized_img = img.resize(
-            scaled_width as u32,
-            scaled_height as u32,
-            image::imageops::FilterType::Lanczos3,
-        );
+    fn delete_image(&mut self, event_loop: &ActiveEventLoop) {
+        let path = self.paths[self.index].clone();
+        if let Err(e) = fs::remove_file(&path) {
+            eprintln!("Failed to delete image {}: {}", path.display(), e);
+            return;
+        }
+        println!("Deleted image: {}", path.display());
 
-        let resized_rgb = resized_img.to_rgb8();
+        self.paths.remove(self.index);
+        if self.paths.is_empty() {
+            event_loop.exit();
+            return;
+        }
+        if self.index >= self.paths.len() {
+            self.index = 0;
+        }
+        if !self.show_current() {
+            // Could not load any remaining image; nothing left to show.
+            event_loop.exit();
+        }
+    }
 
-        // Calculate centering offsets
-        let x_offset = (width - scaled_width) / 2;
-        let y_offset = (height - scaled_height) / 2;
-
-        // Copy resized image to center of buffer
-        for (y, row) in resized_rgb.rows().enumerate() {
-            for (x, pixel) in row.enumerate() {
-                let buffer_x = x + x_offset;
-                let buffer_y = y + y_offset;
-                let buffer_index = buffer_y * width + buffer_x;
-
-                if buffer_index < buffer.len() {
-                    let r = pixel[0] as u32;
-                    let g = pixel[1] as u32;
-                    let b = pixel[2] as u32;
-                    buffer[buffer_index] = (r << 16) | (g << 8) | b;
+    /// Load `self.index` and refresh the window. Returns whether the load
+    /// succeeded; on failure the previously shown image is kept.
+    fn show_current(&mut self) -> bool {
+        match open_image(&self.paths[self.index]) {
+            Ok(img) => {
+                self.image = img;
+                self.generation += 1;
+                if let Some(window) = &self.window {
+                    window.set_title(&self.title());
+                    window.request_redraw();
                 }
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "Failed to load image {}: {}",
+                    self.paths[self.index].display(),
+                    e
+                );
+                false
             }
         }
+    }
 
-        buffer
+    fn render(&mut self) {
+        let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else {
+            return;
+        };
+
+        let size = window.inner_size();
+        let (Some(width), Some(height)) =
+            (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+        else {
+            return; // Minimized or zero-sized; nothing to draw.
+        };
+
+        if let Err(e) = surface.resize(width, height) {
+            eprintln!("Failed to resize surface: {e}");
+            return;
+        }
+        let (w, h) = (width.get(), height.get());
+
+        // Recompute the fitted image only when the window size or image changed.
+        if self.scaled_key != Some((w, h, self.generation)) {
+            self.scaled = Some(fit_image(&self.image, w, h));
+            self.scaled_key = Some((w, h, self.generation));
+        }
+        let scaled = self.scaled.as_ref().unwrap();
+
+        let mut buffer = match surface.buffer_mut() {
+            Ok(buffer) => buffer,
+            Err(e) => {
+                eprintln!("Failed to acquire buffer: {e}");
+                return;
+            }
+        };
+
+        // Black background, then blit the image centered (letterboxing).
+        buffer.fill(0);
+        let x_offset = (w - scaled.width) / 2;
+        let y_offset = (h - scaled.height) / 2;
+        for row in 0..scaled.height {
+            let dst = ((y_offset + row) * w + x_offset) as usize;
+            let src = (row * scaled.width) as usize;
+            let len = scaled.width as usize;
+            buffer[dst..dst + len].copy_from_slice(&scaled.pixels[src..src + len]);
+        }
+
+        if let Err(e) = buffer.present() {
+            eprintln!("Failed to present buffer: {e}");
+        }
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+
+        let (img_w, img_h) = self.image.dimensions();
+        let (win_w, win_h) =
+            initial_size(img_w, img_h, self.requested_width, self.requested_height);
+
+        let attributes = Window::default_attributes()
+            .with_title(self.title())
+            .with_inner_size(LogicalSize::new(win_w, win_h));
+
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Rc::new(window),
+            Err(e) => {
+                eprintln!("Failed to create window: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
+
+        let context = match softbuffer::Context::new(window.clone()) {
+            Ok(context) => context,
+            Err(e) => {
+                eprintln!("Failed to create graphics context: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
+        let surface = match softbuffer::Surface::new(&context, window.clone()) {
+            Ok(surface) => surface,
+            Err(e) => {
+                eprintln!("Failed to create drawing surface: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
+
+        window.request_redraw();
+        self.window = Some(window);
+        self.context = Some(context);
+        self.surface = Some(surface);
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            // Act on the initial press only; `repeat` filters out the OS
+            // key-repeat stream so a held key fires once.
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed && !event.repeat =>
+            {
+                self.handle_key(event.logical_key, event_loop);
+            }
+            WindowEvent::Resized(_) => {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::RedrawRequested => self.render(),
+            _ => {}
+        }
+    }
+}
+
+fn open_image(path: &PathBuf) -> Result<DynamicImage> {
+    image::open(path).with_context(|| format!("Failed to open image: {}", path.display()))
+}
+
+/// Resize `img` to fit within `win_w` x `win_h`, preserving aspect ratio, and
+/// pack the result into a softbuffer-format pixel buffer (`0x00RRGGBB`).
+fn fit_image(img: &DynamicImage, win_w: u32, win_h: u32) -> Scaled {
+    // Triangle (bilinear) is far cheaper than Lanczos3 while staying smooth,
+    // which keeps live window resizing responsive.
+    let resized = img.resize(win_w, win_h, image::imageops::FilterType::Triangle);
+    let (width, height) = resized.dimensions();
+    let rgb = resized.to_rgb8();
+
+    let mut pixels = Vec::with_capacity((width * height) as usize);
+    for pixel in rgb.pixels() {
+        pixels.push((pixel[0] as u32) << 16 | (pixel[1] as u32) << 8 | pixel[2] as u32);
+    }
+
+    Scaled {
+        pixels,
+        width,
+        height,
+    }
+}
+
+/// Pick the initial window size: honor explicit dimensions, otherwise use the
+/// image size scaled down to fit within the default cap (never upscaled).
+fn initial_size(img_w: u32, img_h: u32, req_w: Option<u32>, req_h: Option<u32>) -> (u32, u32) {
+    match (req_w, req_h) {
+        (Some(w), Some(h)) => (w.max(1), h.max(1)),
+        (Some(w), None) => (w.max(1), img_h.max(1)),
+        (None, Some(h)) => (img_w.max(1), h.max(1)),
+        (None, None) => {
+            let img_w = img_w.max(1);
+            let img_h = img_h.max(1);
+            let scale = (MAX_DEFAULT_WIDTH as f64 / img_w as f64)
+                .min(MAX_DEFAULT_HEIGHT as f64 / img_h as f64)
+                .min(1.0);
+            (
+                ((img_w as f64 * scale).round() as u32).max(1),
+                ((img_h as f64 * scale).round() as u32).max(1),
+            )
+        }
     }
 }

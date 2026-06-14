@@ -8,5 +8,6 @@ authors = ["Your Name <your.email@example.com>"]
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
 image = "0.24"
-minifb = "0.25"
 anyhow = "1.0"
+winit = "0.30.13"
+softbuffer = "0.4.8"
